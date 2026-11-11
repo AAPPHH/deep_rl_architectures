@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "actor-critic"
+dynamic = ["version"]
+description = "Shared IMPALA (V-trace) and DreamerV3 algorithm code"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = ["torch", "numpy"]
+
+[project.optional-dependencies]
+ray = ["ray"]
+
+[tool.setuptools]
+packages = ["actor_critic", "actor_critic.tests"]
+
+[tool.setuptools.dynamic]
+version = {attr = "actor_critic.__version__"}
