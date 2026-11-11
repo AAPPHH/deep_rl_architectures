@@ -11,7 +11,7 @@ Consumers: any project that keeps its own env, reward and feature adapters.
 
 Install a released version by tag, without letting pip touch the torch or numpy of the environment:
 
-    pip install --no-deps "actor-critic @ git+https://github.com/AAPPHH/actor-critic@v0.1.0"
+    pip install --no-deps "actor-critic @ git+https://github.com/AAPPHH/deep_rl_architectures@v0.1.0"
 
 Editable installs are for a dev environment only:
 
