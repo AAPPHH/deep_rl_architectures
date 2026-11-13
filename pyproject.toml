@@ -18,5 +18,8 @@ lake = ["pyarrow", "duckdb", "pandas"]
 [tool.setuptools]
 packages = ["deep_rl_architectures", "deep_rl_architectures.tests"]
 
+[tool.setuptools.package-data]
+"deep_rl_architectures.tests" = ["*.pt"]
+
 [tool.setuptools.dynamic]
 version = {attr = "deep_rl_architectures.__version__"}
