@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.amp import GradScaler
 
-from actor_critic.sil import (GoldenMemory, compute_sil_loss, compute_sil_loss_batched, gm_cap_probs, sil_clipped_step, sil_full_cutoff,
+from deep_rl_architectures.sil import (GoldenMemory, compute_sil_loss, compute_sil_loss_batched, gm_cap_probs, sil_clipped_step, sil_full_cutoff,
                                 sil_mc_returns, sil_policy_kl, sil_separate_step)
 
 KW = dict(conf_prob=0.9, conf_heads=2, adv_max_sigma=3.0, conf_sigma=0.05)

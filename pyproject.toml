@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "actor-critic"
+name = "deep-rl-architectures"
 dynamic = ["version"]
 description = "Shared IMPALA (V-trace) and DreamerV3 algorithm code"
 readme = "README.md"
@@ -15,7 +15,7 @@ dependencies = ["torch", "numpy"]
 ray = ["ray"]
 
 [tool.setuptools]
-packages = ["actor_critic", "actor_critic.tests"]
+packages = ["deep_rl_architectures", "deep_rl_architectures.tests"]
 
 [tool.setuptools.dynamic]
-version = {attr = "actor_critic.__version__"}
+version = {attr = "deep_rl_architectures.__version__"}

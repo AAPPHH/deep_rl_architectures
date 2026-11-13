@@ -6,9 +6,9 @@ from queue import Full
 import numpy as np
 import torch
 
-from actor_critic import dreamer_core as C
-from actor_critic import dreamer as DR
-from actor_critic import impala as IM
+from deep_rl_architectures import dreamer_core as C
+from deep_rl_architectures import dreamer as DR
+from deep_rl_architectures import impala as IM
 
 CFG = {
     "seed": 0, "device": "cpu", "cpus": 1, "repval_detach": True, "task": "synthetic", "batch": 3, "T": 6,
@@ -368,7 +368,7 @@ class Stream(unittest.TestCase):
 
     def test_module_imports_without_ray(self):
         import subprocess, sys
-        code = "import sys; sys.modules['ray'] = None; import actor_critic.impala as m; m.check_stream_loops([], wait=lambda l, **k: ([], l), get=lambda r: 0)"
+        code = "import sys; sys.modules['ray'] = None; import deep_rl_architectures.impala as m; m.check_stream_loops([], wait=lambda l, **k: ([], l), get=lambda r: 0)"
         self.assertEqual(subprocess.run([sys.executable, "-c", code], capture_output=True).returncode, 0)
 
 
