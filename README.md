@@ -20,8 +20,11 @@ Editable installs are for a dev environment only:
 
 Tests: `python -m unittest deep_rl_architectures.tests.test_deep_rl_architectures deep_rl_architectures.tests.test_sil deep_rl_architectures.tests.test_lake`
 
+Discrete actions (Dreamer): set `action_space` to `"discrete"` (default `"continuous"`) and `act_unimix` (default 0.01) in the model cfg. `vec.act_dim` is the number of actions; `vec.step` receives a one-hot `(envs, act_dim)` array. The actor is a unimix one-hot categorical trained with REINFORCE on return-normalised advantages; `cfg["eval_greedy"]` (default true) picks argmax or sampling in `evaluate`. `priv_dim` must be at least 1 (use a constant zero column). Continuous-only features (`actor_grad` dynamics/mix, `set_anchor`, `set_data_anchor`, `set_sigma`, `remap_std`) raise ValueError.
+
 Changelog
 
+- 0.4.0: Dreamer discrete action space (OneHotCat actor), golden test pinning the continuous path bit-identical
 - 0.3.0: add lake module (runs, streams, datasets, registry, duckdb query)
 - 0.2.0: package renamed to deep-rl-architectures (formerly actor-critic), no behaviour change
 - 0.1.0: IMPALA and DreamerV3 core, SIL and golden memory

@@ -145,6 +145,27 @@ def gumbel_argmax(p, u):
     return (p.log() + g).argmax(-1)
 
 
+class OneHotCat:
+    def __init__(self, logit, unimix):
+        n = logit.shape[-1]
+        self.probs = (1 - unimix) * F.softmax(f32(logit), -1) + unimix / n
+        self.logp, self.n = self.probs.log(), n
+
+    @property
+    def mode(self):
+        return F.one_hot(self.probs.argmax(-1), self.n).to(self.probs.dtype)
+
+    def sample(self, u=None):
+        idx = torch.distributions.Categorical(probs=self.probs, validate_args=False).sample() if u is None else gumbel_argmax(self.probs, u)
+        return F.one_hot(idx, self.n).to(self.probs.dtype)
+
+    def log_prob(self, a):
+        return (a * self.logp).sum(-1)
+
+    def entropy(self):
+        return -(self.probs * self.logp).sum(-1)
+
+
 def float_key(x):
     b = x.view(torch.int32).to(torch.int64)
     return torch.where(b < 0, b ^ 0x7FFFFFFF, b)

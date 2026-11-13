@@ -11,7 +11,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .dreamer_core import (ACTOR_INS, DIST, Encoder, Fp32, Frozen, HEAD_PREFIX, LaProp, MLP, Noise, OpTrace, RSSM, Replay, ReturnNorm, bin_edges, cat_probs, clip_agc, f32, gauss_nll, kl_terms, lambda_return, symexp, symlog, trunc_init, twohot_decode, twohot_nll)
+from .dreamer_core import (ACTOR_INS, DIST, Encoder, Fp32, Frozen, HEAD_PREFIX, LaProp, MLP, Noise, OneHotCat, OpTrace, RSSM, Replay, ReturnNorm, bin_edges, cat_probs, clip_agc, f32, gauss_nll, kl_terms, lambda_return, symexp, symlog, trunc_init, twohot_decode, twohot_nll)
+
+
+ACTION_SPACES = ("continuous", "discrete")
 
 
 class WorldModel(nn.Module):
@@ -350,7 +353,14 @@ class Dreamer(WorldModel):
             self.register_buffer("actor_u_fit", torch.zeros(1))
         if self.actor_in == "gru_u":
             self.actor_gru = nn.GRUCell(obs_dim, self.gru_hidden)
-        self.actor = MLP(ain, 2 * act_dim, u, c["layers"], outscale=0.01)
+        self.action_space = c.get("action_space", "continuous")
+        if self.action_space not in ACTION_SPACES:
+            raise ValueError(f"model.action_space must be one of {ACTION_SPACES}, got {self.action_space!r}")
+        self.discrete = self.action_space == "discrete"
+        self.act_unimix = float(c.get("act_unimix", 0.01))
+        if self.discrete and (act_dim < 2 or not 0.0 <= self.act_unimix < 1.0):
+            raise ValueError(f"discrete actions need act_dim >= 2 and act_unimix in [0, 1), got {act_dim} and {self.act_unimix}")
+        self.actor = MLP(ain, act_dim if self.discrete else 2 * act_dim, u, c["layers"], outscale=0.01)
         self.critic = MLP(cin, c["bins"], u, c["layers"], outscale=0.0)
         self.slow = copy.deepcopy(self.critic).requires_grad_(False)
         self.retnorm = ReturnNorm(c["ret_decay"], c["ret_lo"], c["ret_hi"])
@@ -442,7 +452,12 @@ class Dreamer(WorldModel):
                 p.requires_grad_(False)
         self.init_opt()
 
+    def reject_discrete(self, what):
+        if self.discrete:
+            raise ValueError(f"{what} is continuous-only and is rejected for action_space 'discrete'")
+
     def set_anchor(self, state=None):
+        self.reject_discrete("the KL anchor (set_anchor)")
         a = copy.deepcopy(self.actor).requires_grad_(False)
         if state is not None:
             a.load_state_dict(state)
@@ -451,6 +466,8 @@ class Dreamer(WorldModel):
     data_anchor = None
 
     def set_data_anchor(self, cfg):
+        if cfg:
+            self.reject_discrete("the BC data anchor")
         self.data_anchor = None if not cfg else {"coef": float(cfg["coef"]), "follow_beta": bool(cfg.get("follow_beta", True)), "replace_kl": bool(cfg.get("replace_kl", False)), "target": cfg.get("target", "sample"), "sigma": float(cfg.get("sigma", 0.3)), "feat_ref": cfg.get("feat_ref"), "all_rows": bool(cfg.get("all_rows", False))}
         self.__dict__["frozen_wm"] = None
         if self.data_anchor is not None and self.data_anchor["target"] not in ("sample", "teacher_mu", "teacher_live"):
@@ -476,6 +493,7 @@ class Dreamer(WorldModel):
         return torch.where(hi, up, torch.where(lo, dn, inner)).sum(-1)
 
     def set_sigma(self, sigma, net=None):
+        self.reject_discrete("set_sigma")
         lo, hi = float(self.cfg["min_std"]), float(self.cfg["max_std"])
         if not lo < float(sigma) < hi:
             raise ValueError(f"sigma_init {sigma} must lie strictly between min_std {lo} and max_std {hi}")
@@ -493,6 +511,7 @@ class Dreamer(WorldModel):
 
     @torch.no_grad()
     def remap_std(self, lo0, hi0, probe=4096):
+        self.reject_discrete("remap_std")
         lo, hi, out = float(self.cfg["min_std"]), float(self.cfg["max_std"]), self.actor.out
         half = out.out_features // 2
         h = self.actor.body(0.5 * torch.randn(probe, self.actor.body[0].in_features, generator=torch.Generator().manual_seed(0)).to(out.weight.device))
@@ -525,6 +544,8 @@ class Dreamer(WorldModel):
             raise ValueError(f"train.actor_grad_mix must be in [0, 1], got {actor_grad_mix!r}")
         if actor_grad != "reinforce" and (self.ens_active() or self.actor_in != "latent"):
             raise ValueError("train.actor_grad dynamics/mix supports neither reward/dyn ensembles nor model.actor_in other than 'latent'")
+        if actor_grad != "reinforce":
+            self.reject_discrete("train.actor_grad dynamics/mix (needs rsample)")
         self.imag_prior, self.actor_grad = imag_prior, actor_grad
         self.actor_rho = {"reinforce": 1.0, "dynamics": 0.0, "mix": float(actor_grad_mix)}[actor_grad]
         self.adv_mode, self.adv_floor, self.imag_clamp = adv_norm, float(adv_floor), bool(imag_clamp)
@@ -613,6 +634,8 @@ class Dreamer(WorldModel):
         return self.actor_dist(feat, u, self.actor_gru_seq(u, first) if self.actor_in == "gru_u" else None)
 
     def actor_dist(self, feat, u=None, g=None):
+        if self.discrete:
+            return OneHotCat(self.actor(self.actor_inp(feat, u, g)), self.act_unimix)
         mu, raw = self.actor(self.actor_inp(feat, u, g)).chunk(2, -1)
         std = (self.cfg["max_std"] - self.cfg["min_std"]) * torch.sigmoid(raw + 2.0) + self.cfg["min_std"]
         return torch.distributions.Independent(torch.distributions.Normal(torch.tanh(mu), std, validate_args=False), 1, validate_args=False)
@@ -629,6 +652,8 @@ class Dreamer(WorldModel):
             state = self.rssm.initial(obs.shape[0])
         deter, stoch, _, _ = self.rssm.obs_step(state[0], state[1], prev_act, first, self.enc(obs))
         dist = self.actor_dist(self.feat(deter, stoch))
+        if self.discrete:
+            return (dist.mode if greedy else dist.sample()), (deter, stoch)
         return (dist.mean if greedy else dist.sample()).clamp(-1, 1), (deter, stoch)
 
     @torch.no_grad()
@@ -647,7 +672,9 @@ class Dreamer(WorldModel):
         for h in range(H + 1):
             feat = self.feat(deter, stoch)
             dist = self.actor_dist(feat)
-            if self.noise.legacy:
+            if self.discrete:
+                a = dist.sample(None if self.noise.legacy else self.noise.uniform(dist.probs.shape, dist.probs))
+            elif self.noise.legacy:
                 a = dist.rsample() if grad else dist.sample()
             else:
                 a = dist.mean + dist.base_dist.scale * self.noise.normal(dist.mean.shape, dist.mean)
@@ -757,7 +784,7 @@ class Dreamer(WorldModel):
             L["policy"] = -(w * (self.actor_rho * dist.log_prob(iact[:, :H]) * adv + (1 - self.actor_rho) * dyn_t + self.ent_c() * dist.entropy())).mean()
         else:
             L["policy"] = -(w * (dist.log_prob(iact[:, :H]) * adv + self.ent_c() * dist.entropy())).mean()
-        a_sigma = dist.base_dist.scale.detach()
+        a_sigma = None if self.discrete else dist.base_dist.scale.detach()
         L["value"] = (w * (twohot_nll(vlogit[:, :H], ret, self.edges) + twohot_nll(vlogit[:, :H], slow_i[:, :H], self.edges))).mean()
         rpriv = {"none": None, "decoded": mu.detach(), "mixed": psym}[c["critic_priv"]]
         rin = self.critic_in(feat.detach() if c["repval_detach"] else feat, rpriv)
@@ -807,8 +834,7 @@ class Dreamer(WorldModel):
             step = (self.ac_ctl[0] > 0).float() * d["lr"] * (kl_ref - tgt) / tgt
             self.dual_lb.copy_((self.dual_lb + step).clamp(math.log(d["lo"]), math.log(d["hi"])))
         out = {k: x.detach() for k, x in L.items()}
-        out.update(ret_scale=scale, priv_rmse=priv_rmse.mean(), priv_rmse_dims=priv_rmse, wm_sigma=ls.detach().exp().mean(), actor_sigma_mean=a_sigma.mean(),
-                   actor_sigma_min=a_sigma.amin(), adv_std=adv.std(),
+        out.update(ret_scale=scale, priv_rmse=priv_rmse.mean(), priv_rmse_dims=priv_rmse, wm_sigma=ls.detach().exp().mean(), **({"actor_entropy": dist.entropy().detach().mean()} if self.discrete else {"actor_sigma_mean": a_sigma.mean(), "actor_sigma_min": a_sigma.amin()}), adv_std=adv.std(),
                    ret_mean=ret[:, :H].mean().detach(), v_mean=v[:, :H].mean(), adv_mean=adv.mean(), v_ev=1.0 - (ret[:, :H] - v[:, :H]).var() / ret[:, :H].var().clamp(min=1e-8))
         if self.bc_actor is not None:
             out["mu_bc_diff"] = mu_bc_diff
@@ -865,7 +891,7 @@ def evaluate(agent, vec, dev, episodes):
     obs = np.stack(obs)
     first, prev, state, ret, done, out = np.ones((n, 1), np.float32), np.zeros((n, agent.A), np.float32), None, np.zeros(n), np.zeros(n, bool), []
     while not done.all():
-        a, state = agent.act(torch.as_tensor(obs, device=dev), torch.as_tensor(first[:, 0], device=dev), torch.as_tensor(prev, device=dev), state, greedy=True)
+        a, state = agent.act(torch.as_tensor(obs, device=dev), torch.as_tensor(first[:, 0], device=dev), torch.as_tensor(prev, device=dev), state, greedy=bool(agent.cfg.get("eval_greedy", True)))
         a = a.cpu().numpy()
         obs, _, r, term, trunc = vec.step(a)
         ret += r * ~done
@@ -898,7 +924,7 @@ def train(cfg, make_vec):
     bt = cfg["batch"] * cfg["T"]
     while env_steps < cfg["steps"]:
         if env_steps < cfg["prefill"]:
-            act = rng.uniform(-1, 1, size=(E, A)).astype(np.float32)
+            act = np.eye(A, dtype=np.float32)[rng.integers(0, A, size=E)] if agent.discrete else rng.uniform(-1, 1, size=(E, A)).astype(np.float32)
         else:
             a, state = agent.act(torch.as_tensor(obs, dtype=torch.float32, device=dev), torch.as_tensor(first[:, 0], device=dev), torch.as_tensor(prev, device=dev), state)
             act = a.cpu().numpy()
