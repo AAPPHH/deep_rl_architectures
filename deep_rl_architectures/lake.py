@@ -18,15 +18,55 @@ PARQUET_OPTS = {"compression": "zstd"}
 PART = re.compile(r"^(?P<name>.+)_(?P<idx>\d{4})\.parquet$")
 
 
-def to_table(item, schema=None):
+def rows_to_table(rows):
+    keys = list(dict.fromkeys(k for r in rows for k in r))
+    return pa.table({k: [r.get(k) for r in rows] for k in keys})
+
+
+def to_table(item):
     if isinstance(item, pa.Table):
-        return item if schema is None or item.schema.equals(schema) else item.select(schema.names).cast(schema)
+        return item
+    if isinstance(item, pa.RecordBatch):
+        return pa.Table.from_batches([item])
     if isinstance(item, dict):
         item = [item]
-    if not isinstance(item, list):
-        item = pa.Table.from_pandas(item, preserve_index=False)
-        return to_table(item, schema)
-    return pa.Table.from_pylist(item, schema=schema)
+    if isinstance(item, list):
+        return rows_to_table(item)
+    return pa.Table.from_pandas(item, preserve_index=False)
+
+
+def evolve(schema, t):
+    fields = {f.name: f for f in schema}
+    for f in t.schema:
+        old = fields.get(f.name)
+        if old is None:
+            fields[f.name] = f
+        elif old.type.equals(f.type) or pa.types.is_null(f.type):
+            continue
+        elif pa.types.is_null(old.type):
+            fields[f.name] = f
+        else:
+            if not (pa.types.is_string(f.type) and not pa.types.is_string(old.type)):
+                try:
+                    t[f.name].cast(old.type)
+                    continue
+                except pa.ArrowException:
+                    pass
+            merged = pa.unify_schemas([pa.schema([old]), pa.schema([f])], promote_options="permissive")
+            fields[f.name] = pa.field(f.name, merged.field(0).type)
+    return pa.schema(list(fields.values()))
+
+
+def conform(t, schema):
+    if t.schema.equals(schema):
+        return t
+    arrays = [t[f.name].cast(f.type) if f.name in t.column_names else pa.nulls(t.num_rows, f.type) for f in schema]
+    return pa.Table.from_arrays(arrays, schema=schema)
+
+
+def concat(tables):
+    tables = [t for t in tables if t.num_columns]
+    return pa.concat_tables(tables, promote_options="permissive") if tables else None
 
 
 def schema_fingerprint(schema):
@@ -36,9 +76,19 @@ def schema_fingerprint(schema):
 def read_ipc(path):
     for op in (ipc.open_stream, ipc.open_file):
         try:
-            return op(str(path)).read_all()
+            r = op(str(path))
+        except Exception:
+            continue
+        batches = []
+        try:
+            if hasattr(r, "num_record_batches"):
+                batches = [r.get_batch(i) for i in range(r.num_record_batches)]
+            else:
+                for b in r:
+                    batches.append(b)
         except Exception:
             pass
+        return pa.Table.from_batches(batches, schema=r.schema)
     return None
 
 
@@ -48,12 +98,13 @@ def read_parts(directory, stream, columns=None):
     for f in sorted(directory.glob(f"{stream}_*.parquet")):
         m = PART.match(f.name)
         if m and m["name"] == stream:
-            parts.append(pq.read_table(f, columns=columns))
+            cols = None if columns is None else [c for c in columns if c in pq.read_schema(f).names]
+            parts.append(pq.read_table(f, columns=cols))
     live = directory / f"{stream}.live.arrow"
     if live.exists():
         t = read_ipc(live)
         if t is not None and t.num_rows:
-            parts.append(t.select(columns) if columns else t)
+            parts.append(t if columns is None else t.select([c for c in columns if c in t.column_names]))
     return parts
 
 
@@ -92,6 +143,7 @@ class Stream:
         self.roll_idx = 1 + max([int(m["idx"]) for f in self.base_dir.glob(f"{name}_*.parquet") if (m := PART.match(f.name)) and m["name"] == name], default=-1)
         self.sink = None
         self.writer = None
+        self.roll_live()
 
     def add(self, item):
         self.pending.append(item)
@@ -106,41 +158,61 @@ class Stream:
             self.sink.close()
             self.writer = self.sink = None
 
-    def write_pending(self):
-        if not self.pending:
+    def append_table(self, t):
+        if t.num_rows == 0:
             return
-        tables, rows = [], []
-        for it in self.pending:
-            if isinstance(it, list) or isinstance(it, dict):
-                rows.extend(it if isinstance(it, list) else [it])
-                continue
-            if rows:
-                tables.append(to_table(rows, self.schema))
-                rows = []
-            tables.append(to_table(it, self.schema))
-            self.schema = self.schema or tables[-1].schema
-        if rows:
-            tables.append(to_table(rows, self.schema))
-        self.pending = []
-        self.schema = self.schema or tables[0].schema
+        new = t.schema if self.schema is None else evolve(self.schema, t)
+        if self.schema is not None and not new.equals(self.schema):
+            self.roll_live()
+        self.schema = new
         if self.writer is None:
             self.open_writer()
-        for t in tables:
-            t = t if t.schema.equals(self.schema) else t.select(self.schema.names).cast(self.schema)
-            for b in t.to_batches():
-                self.writer.write_batch(b)
+        for b in conform(t, self.schema).to_batches():
+            self.writer.write_batch(b)
 
-    def roll(self):
-        self.write_pending()
-        self.last_roll = time.time()
-        if self.writer is None:
-            return
+    def write_pending(self):
+        items, self.pending = self.pending, []
+        groups = []
+        for it in items:
+            if isinstance(it, (list, dict)):
+                rows = it if isinstance(it, list) else [it]
+                if groups and isinstance(groups[-1], list):
+                    groups[-1].extend(rows)
+                else:
+                    groups.append(list(rows))
+            else:
+                groups.append(it)
+        errors = []
+        for g in groups:
+            try:
+                self.append_table(to_table(g))
+            except Exception as e:
+                errors.append(e)
+        if errors:
+            raise errors[0]
+
+    def roll_live(self):
         self.close_writer()
+        if not self.arrow_path.exists():
+            return
         t = read_ipc(self.arrow_path)
-        if t is not None and t.num_rows:
-            pq.write_table(t, str(self.base_dir / f"{self.name}_{self.roll_idx:04d}.parquet"), **self.parquet_opts)
+        if t is None:
+            self.arrow_path.replace(self.arrow_path.with_name(f"{self.name}.{time.time_ns()}.corrupt"))
+            return
+        if t.num_rows:
+            final = self.base_dir / f"{self.name}_{self.roll_idx:04d}.parquet"
+            tmp = final.with_suffix(".parquet.tmp")
+            pq.write_table(t, str(tmp), **self.parquet_opts)
+            tmp.replace(final)
             self.roll_idx += 1
         self.arrow_path.unlink(missing_ok=True)
+
+    def roll(self):
+        try:
+            self.write_pending()
+        finally:
+            self.roll_live()
+            self.last_roll = time.time()
 
     def flush(self):
         self.write_pending()
@@ -162,11 +234,19 @@ class Run:
         self.streams = {}
         for name, schema in (streams or {}).items():
             self.stream(name, schema)
+        old = {}
+        try:
+            old = json.loads((self.run_dir / "run_meta.json").read_text())
+        except Exception:
+            pass
         self.meta = {"run_id": run_id, "created_at": time.time(), "config": config or {}, "git": git_hash(),
                      "package_version": module_version("deep_rl_architectures"), "python": platform.python_version(),
                      "torch": module_version("torch"), "host": socket.gethostname()}
         if resume_source is not None:
             self.meta["resume_source"] = resume_source
+        if old:
+            resume = {k: self.meta[k] for k in ("created_at", "config", "git", "host") + (("resume_source",) if resume_source is not None else ())}
+            self.meta = {**old, "resumes": old.get("resumes", []) + [resume]}
         atomic_write_json(self.run_dir / "run_meta.json", self.meta)
 
     def stream(self, name, schema=None):
@@ -177,13 +257,21 @@ class Run:
     def log(self, stream, data):
         self.stream(stream).add(data)
 
+    def each(self, op):
+        err = None
+        for s in list(self.streams.values()):
+            try:
+                getattr(s, op)()
+            except Exception as e:
+                err = err or e
+        if err:
+            raise err
+
     def flush(self):
-        for s in self.streams.values():
-            s.flush()
+        self.each("flush")
 
     def close(self):
-        for s in self.streams.values():
-            s.close()
+        self.each("close")
 
     def ckpt_path(self, name):
         return self.ckpt_dir / name
@@ -205,7 +293,16 @@ class Lake:
         self.registry_path = self.root / "registry.parquet"
 
     def run(self, run_id=None, config=None, streams=None, roll_interval_s=600, resume_source=None):
-        return Run(self, run_id or f"{self.prefix}_{time.strftime('%Y%m%d_%H%M%S')}", config, streams, roll_interval_s, resume_source)
+        if run_id is None:
+            base, n = f"{self.prefix}_{time.strftime('%Y%m%d_%H%M%S')}", 0
+            while True:
+                run_id = base if n == 0 else f"{base}_{n}"
+                try:
+                    (self.root / "runs" / run_id).mkdir(parents=True)
+                    break
+                except FileExistsError:
+                    n += 1
+        return Run(self, run_id, config, streams, roll_interval_s, resume_source)
 
     def run_dir(self, run_id):
         return self.root / "runs" / run_id
@@ -223,8 +320,8 @@ class Lake:
 
     def read(self, run_id, stream, columns=None, dedup=None):
         import pandas as pd
-        parts = [t.to_pandas() for t in read_parts(self.run_dir(run_id), stream, columns)]
-        df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=columns or [])
+        merged = concat(read_parts(self.run_dir(run_id), stream, columns))
+        df = merged.to_pandas() if merged is not None else pd.DataFrame(columns=columns or [])
         if dedup and len(df):
             df = df.drop_duplicates(dedup, keep="last").reset_index(drop=True)
         return df
@@ -242,13 +339,17 @@ class Lake:
         import duckdb
         con = duckdb.connect()
         for name in self.stream_names():
+            if not re.search(rf"\b{re.escape(name)}\b", sql):
+                continue
             tables = []
             for d in sorted((self.root / "runs").iterdir()):
                 for t in read_parts(d, name):
+                    if "run_id" in t.column_names:
+                        t = t.rename_columns(["stream_run_id" if c == "run_id" else c for c in t.column_names])
                     tables.append(t.append_column("run_id", pa.array([d.name] * t.num_rows, pa.string())))
-            if not tables:
+            merged = concat(tables)
+            if merged is None:
                 continue
-            merged = pa.concat_tables(tables, promote_options="default")
             con.register(f"_{name}_tbl", merged)
             con.execute(f'CREATE VIEW "{name}" AS SELECT * FROM "_{name}_tbl"')
         return con.execute(sql).df()
@@ -278,7 +379,7 @@ class Lake:
         if out.exists():
             shutil.rmtree(out)
         out.mkdir(parents=True)
-        items = [data] if isinstance(data, (pa.Table, dict)) or hasattr(data, "to_dict") else data
+        items = [data] if isinstance(data, (pa.Table, pa.RecordBatch, dict)) or hasattr(data, "to_dict") else data
         state = {"schema": None, "buf": [], "n": 0, "shards": 0, "rows": 0}
 
         def emit(table):
@@ -300,8 +401,12 @@ class Lake:
                 state["buf"], state["n"] = [table], table.num_rows
 
         for it in items:
-            t = to_table(it, state["schema"])
-            state["schema"] = state["schema"] or t.schema
+            t = to_table(it)
+            new = t.schema if state["schema"] is None else evolve(state["schema"], t)
+            if state["schema"] is not None and not new.equals(state["schema"]):
+                state["buf"] = [conform(b, new) for b in state["buf"]]
+            state["schema"] = new
+            t = conform(t, new)
             state["buf"].append(t)
             state["n"] += t.num_rows
             if state["n"] >= shard_rows:
@@ -311,7 +416,7 @@ class Lake:
         full = {**(meta or {}), "name": name, "version": version, "rows": state["rows"], "shards": state["shards"],
                 "schema": {f.name: str(f.type) for f in schema}, "created_at": time.time()}
         atomic_write_json(out / "meta.json", full)
-        self.registry_append([{"name": name, "version": version, "path": str(out.relative_to(self.root)), "rows": state["rows"],
+        self.registry_append([{"name": name, "version": version, "path": out.relative_to(self.root).as_posix(), "rows": state["rows"],
                                "schema_fp": schema_fingerprint(schema), "source": (meta or {}).get("source"), "created_at": full["created_at"]}])
         return out
 
@@ -327,4 +432,5 @@ class Lake:
 
     def read_dataset(self, name, version=None, columns=None):
         path = self.dataset(name, version)["path"]
-        return pa.concat_tables([pq.read_table(f, columns=columns) for f in sorted(path.glob("shard_*.parquet"))])
+        merged = concat([pq.read_table(f, columns=columns) for f in sorted(path.glob("shard_*.parquet"))])
+        return pa.table({}) if merged is None else merged
