@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import numpy as np
 import platform
 import re
@@ -39,7 +40,7 @@ def to_table(item):
     return pa.Table.from_pandas(item, preserve_index=False)
 
 
-def evolve(schema, t):
+def evolve(schema, t, strict=True):
     fields = {f.name: f for f in schema}
     for f in t.schema:
         old = fields.get(f.name)
@@ -56,8 +57,13 @@ def evolve(schema, t):
                     continue
                 except pa.ArrowException:
                     pass
-            merged = pa.unify_schemas([pa.schema([old]), pa.schema([f])], promote_options="permissive")
-            fields[f.name] = pa.field(f.name, merged.field(0).type)
+            try:
+                ftype = pa.unify_schemas([pa.schema([old]), pa.schema([f])], promote_options="permissive").field(0).type
+            except pa.ArrowException:
+                if strict:
+                    raise
+                ftype = pa.string()
+            fields[f.name] = pa.field(f.name, ftype)
     return pa.schema(list(fields.values()))
 
 
@@ -70,7 +76,15 @@ def conform(t, schema):
 
 def concat(tables):
     tables = [t for t in tables if t.num_columns]
-    return pa.concat_tables(tables, promote_options="permissive") if tables else None
+    if not tables:
+        return None
+    try:
+        return pa.concat_tables(tables, promote_options="permissive")
+    except pa.ArrowException:
+        schema = pa.schema([])
+        for t in tables:
+            schema = evolve(schema, t, strict=False)
+        return pa.concat_tables([conform(t, schema) for t in tables])
 
 
 def schema_fingerprint(schema):
@@ -98,9 +112,10 @@ def read_ipc(path):
 
 def indexed(directory, stream, pattern, suffix):
     out = {}
-    for f in Path(directory).glob(f"{stream}_*{suffix}"):
+    path = Path(directory) / stream
+    for f in path.parent.glob(f"{path.name}_*{suffix}"):
         m = pattern.match(f.name)
-        if m and m["name"] == stream:
+        if m and m["name"] == path.name:
             out[int(m["idx"])] = f
     return out
 
@@ -116,34 +131,73 @@ def snapshot(directory, stream):
     return indexed(directory, stream, ROLLING, ".rolling"), indexed(directory, stream, PART, ".parquet")
 
 
-def read_parts(directory, stream, columns=None):
+def read_index(parquet, rolling, columns):
+    for _ in range(2):
+        if parquet.exists():
+            try:
+                return read_part(parquet, columns, pq.read_table)
+            except FileNotFoundError:
+                continue
+        if rolling.exists():
+            t = read_part(rolling, columns, read_ipc)
+            if t is not None or rolling.exists():
+                return t
+    raise FileNotFoundError(parquet)
+
+
+def read_parts(directory, stream, columns=None, attempts=400):
     directory = Path(directory)
     live = directory / f"{stream}.live.arrow"
-    parts = []
-    for attempt in range(20):
+    for attempt in range(attempts):
         rolling, parquet = snapshot(directory, stream)
-        items = sorted([(i, f, pq.read_table) for i, f in parquet.items()] + [(i, f, read_ipc) for i, f in rolling.items() if i not in parquet], key=lambda x: x[0])
+        idxs = sorted({*rolling, *parquet})
+        base = directory / stream
         try:
-            parts = [read_part(f, columns, r) for _, f, r in items]
+            parts = [read_index(Path(f"{base}_{i:04d}.parquet"), Path(f"{base}_{i:04d}.rolling"), columns) for i in idxs]
             parts.append(read_part(live, columns, read_ipc) if live.exists() else None)
         except FileNotFoundError:
+            time.sleep(min(0.001 * (attempt + 1), 0.05))
             continue
         after = snapshot(directory, stream)
-        if (set(after[0]), set(after[1])) == (set(rolling), set(parquet)) or attempt == 19:
-            break
-    return [p for p in parts if p is not None]
+        if max([*after[0], *after[1]], default=-1) <= max(idxs, default=-1):
+            return [p for p in parts if p is not None]
+        time.sleep(min(0.001 * (attempt + 1), 0.05))
+    raise RuntimeError(f"no consistent snapshot of stream {stream} in {directory}")
 
 
-def jsonable(o):
+def stream_keys(run_dir):
+    run_dir = Path(run_dir)
+    keys = set()
+    for f in run_dir.rglob("*"):
+        rel = f.relative_to(run_dir).parent
+        if f.name.endswith(".live.arrow"):
+            keys.add((rel / f.name[:-len(".live.arrow")]).as_posix())
+        elif f.suffix in (".parquet", ".rolling") and (m := (PART if f.suffix == ".parquet" else ROLLING).match(f.name)):
+            keys.add((rel / m["name"]).as_posix())
+    return sorted(keys)
+
+
+def resolve_stream(run_dir, stream):
+    keys = stream_keys(run_dir)
+    return stream if stream in keys else next((k for k in keys if Path(k).name == stream), stream)
+
+
+def jsonable(o, seen=frozenset()):
+    if isinstance(o, (dict, list, tuple, set, frozenset)):
+        if id(o) in seen:
+            return "<cycle>"
+        seen = seen | {id(o)}
     if isinstance(o, dict):
-        return {k if isinstance(k, str) else str(k): jsonable(v) for k, v in o.items()}
+        return {k if isinstance(k, str) else str(k): jsonable(v, seen) for k, v in o.items()}
     if isinstance(o, (list, tuple, set, frozenset)):
-        return [jsonable(v) for v in (sorted(o, key=str) if isinstance(o, (set, frozenset)) else o)]
+        return [jsonable(v, seen) for v in (sorted(o, key=str) if isinstance(o, (set, frozenset)) else o)]
     if isinstance(o, np.ndarray):
-        return jsonable(o.tolist())
+        return jsonable(o.tolist(), seen)
     if isinstance(o, np.generic):
-        return jsonable(o.item())
-    if o is None or isinstance(o, (str, bool, int, float)):
+        return jsonable(o.item(), seen)
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if o is None or isinstance(o, (str, bool, int)):
         return o
     if isinstance(o, bytes):
         return o.decode("utf-8", "replace")
@@ -153,8 +207,9 @@ def jsonable(o):
 def atomic_write_json(path, obj):
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
+    safe = jsonable(obj)
     with open(tmp, "w") as f:
-        json.dump(jsonable(obj), f, indent=2)
+        json.dump(safe, f, indent=2, allow_nan=False)
     tmp.replace(path)
 
 
@@ -186,6 +241,7 @@ class Stream:
         self.futures = []
         self.sink = None
         self.writer = None
+        self.arrow_path.parent.mkdir(parents=True, exist_ok=True)
         self.roll_idx = 1 + max([*indexed(self.base_dir, name, PART, ".parquet"), *indexed(self.base_dir, name, ROLLING, ".rolling")], default=-1)
         self.salvage()
         self.roll_live()
@@ -233,10 +289,19 @@ class Stream:
                 self.append_table(to_table(g))
             except Exception as e:
                 errors.append(e)
+                if isinstance(g, list) and len(g) > 1:
+                    for row in g:
+                        try:
+                            self.append_table(to_table(row))
+                        except Exception as e2:
+                            errors.append(e2)
         if errors:
             raise errors[0]
 
     def convert(self, rolling, final):
+        if rolling.stat().st_size == 0:
+            rolling.unlink()
+            return
         t = read_ipc(rolling)
         if t is None:
             rolling.replace(rolling.with_name(f"{rolling.name}.{time.time_ns()}.corrupt"))
@@ -260,6 +325,9 @@ class Stream:
     def roll_live(self):
         self.close_writer()
         if not self.arrow_path.exists():
+            return
+        if self.arrow_path.stat().st_size == 0:
+            self.arrow_path.unlink()
             return
         idx = self.roll_idx
         rolling = self.part_path(idx, ".rolling")
@@ -347,8 +415,9 @@ class Run:
         self.each("close")
 
     def update_meta(self, **blobs):
-        self.meta.update(blobs)
-        atomic_write_json(self.run_dir / "run_meta.json", self.meta)
+        new = {**self.meta, **blobs}
+        atomic_write_json(self.run_dir / "run_meta.json", new)
+        self.meta = new
 
     def ckpt_path(self, name):
         if isinstance(name, str):
@@ -367,7 +436,11 @@ class Run:
         return self
 
     def __exit__(self, *exc):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            if exc[0] is None:
+                raise
         return False
 
 
@@ -407,20 +480,14 @@ class Lake:
 
     def read(self, run_id, stream, columns=None, dedup=None):
         import pandas as pd
-        merged = concat(read_parts(self.run_dir(run_id), stream, columns))
+        merged = concat(read_parts(self.run_dir(run_id), resolve_stream(self.run_dir(run_id), stream), columns))
         df = merged.to_pandas() if merged is not None else pd.DataFrame(columns=columns or [])
         if dedup and len(df):
             df = df.drop_duplicates(dedup, keep="last").reset_index(drop=True)
         return df
 
     def stream_names(self):
-        names = set()
-        for f in (self.root / "runs").glob("*/*"):
-            if f.name.endswith(".live.arrow"):
-                names.add(f.name[:-len(".live.arrow")])
-            elif f.suffix in (".parquet", ".rolling") and (m := (PART if f.suffix == ".parquet" else ROLLING).match(f.name)):
-                names.add(m["name"])
-        return sorted(names)
+        return sorted({Path(k).name for d in (self.root / "runs").iterdir() if d.is_dir() for k in stream_keys(d)})
 
     def query(self, sql):
         import duckdb
@@ -430,10 +497,13 @@ class Lake:
                 continue
             tables = []
             for d in sorted((self.root / "runs").iterdir()):
-                for t in read_parts(d, name):
-                    if "run_id" in t.column_names:
-                        t = t.rename_columns(["stream_run_id" if c == "run_id" else c for c in t.column_names])
-                    tables.append(t.append_column("run_id", pa.array([d.name] * t.num_rows, pa.string())))
+                if not d.is_dir():
+                    continue
+                for key in (k for k in stream_keys(d) if Path(k).name == name):
+                    for t in read_parts(d, key):
+                        if "run_id" in t.column_names:
+                            t = t.rename_columns(["stream_run_id" if c == "run_id" else c for c in t.column_names])
+                        tables.append(t.append_column("run_id", pa.array([d.name] * t.num_rows, pa.string())))
             merged = concat(tables)
             if merged is None:
                 continue

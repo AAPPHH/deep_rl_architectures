@@ -362,3 +362,82 @@ class LakeCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_review_nested_streams(self):
+        d = self.lake.run_dir("n1") / "traj" / "gate_events"
+        d.mkdir(parents=True)
+        pq.write_table(pa.table({"i": [1, 2]}), str(self.lake.run_dir("n1") / "traj" / "traj_0000.parquet"))
+        pq.write_table(pa.table({"g": [1]}), str(d / "gate_events_0000.parquet"))
+        self.assertEqual(len(self.lake.read("n1", "traj")), 2)
+        self.assertEqual(len(self.lake.read("n1", "traj/traj")), 2)
+        self.assertEqual(len(self.lake.read("n1", "gate_events")), 1)
+        self.assertIn("gate_events", self.lake.stream_names())
+        self.assertEqual(int(self.lake.query("select count(*) c from traj").c[0]), 2)
+        run = self.lake.run("n1")
+        run.log("traj/traj", {"i": 3})
+        run.close()
+        self.assertEqual(len(self.lake.read("n1", "traj")), 3)
+        self.assertEqual(len(pq.read_table(str(self.lake.run_dir("n1") / "traj" / "traj_0000.parquet"))), 2)
+
+    def test_review_reader_never_gapped_under_rolls(self):
+        run = self.lake.run("g1", roll_interval_s=0)
+        stop, bad = threading.Event(), []
+
+        def reader():
+            while not stop.is_set():
+                ids = sorted(self.lake.read("g1", "x")["i"].tolist()) if run.streams.get("x") else []
+                if ids != list(range(len(ids))):
+                    bad.append(ids)
+
+        th = threading.Thread(target=reader)
+        th.start()
+        for i in range(60):
+            run.log("x", {"i": i})
+            run.flush()
+        stop.set()
+        th.join()
+        run.close()
+        self.assertEqual(bad, [])
+        self.assertEqual(self.lake.read("g1", "x")["i"].tolist(), list(range(60)))
+
+    def test_review_bad_row_does_not_drop_neighbours(self):
+        with self.lake.run("b1") as run:
+            run.log("x", {"i": 4, "s": 1})
+            run.flush()
+            run.log("x", [{"i": 5, "s": "str"}, {"i": 6}])
+            try:
+                run.flush()
+            except Exception:
+                pass
+        self.assertIn(6, self.lake.read("b1", "x")["i"].tolist())
+
+    def test_review_string_vs_int_across_shards(self):
+        d = self.lake.run_dir("s1")
+        d.mkdir(parents=True)
+        pq.write_table(pa.table({"s": ["a"]}), str(d / "m_0003.parquet"))
+        pq.write_table(pa.table({"s": [1]}), str(d / "m_0004.parquet"))
+        self.assertEqual(sorted(self.lake.read("s1", "m")["s"].tolist()), ["1", "a"])
+        self.assertEqual(len(self.lake.query("select * from m")), 2)
+
+    def test_review_zero_byte_live_and_meta_robust(self):
+        d = self.lake.run_dir("z1")
+        d.mkdir(parents=True)
+        (d / "metrics.live.arrow").write_bytes(b"")
+        run = self.lake.run("z1")
+        run.log("metrics", {"a": 1})
+        run.close()
+        self.assertEqual([f.name for f in d.glob("metrics_*")], ["metrics_0000.parquet"])
+        run.update_meta(v=float("nan"), w=np.float32("inf"))
+        self.assertIsNone(json.loads((d / "run_meta.json").read_text())["v"])
+        cyc = {}
+        cyc["self"] = cyc
+        run.update_meta(c=cyc)
+        run.update_meta(ok=1)
+        self.assertEqual(json.loads((d / "run_meta.json").read_text())["ok"], 1)
+
+    def test_review_exit_does_not_mask_training_error(self):
+        with self.assertRaises(ValueError):
+            with self.lake.run("e1") as run:
+                run.log("x", {"a": 1})
+                run.streams["x"].convert = lambda *a: (_ for _ in ()).throw(OSError("boom"))
+                raise ValueError("train")
