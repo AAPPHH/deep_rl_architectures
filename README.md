@@ -18,7 +18,7 @@ Editable installs are for a dev environment only:
 
     pip install --no-deps -e .
 
-Tests: `python -m unittest deep_rl_architectures.tests.test_deep_rl_architectures deep_rl_architectures.tests.test_sil deep_rl_architectures.tests.test_lake`
+Tests: `python -m unittest deep_rl_architectures.tests.test_deep_rl_architectures deep_rl_architectures.tests.test_sil deep_rl_architectures.tests.test_lake deep_rl_architectures.tests.test_dreamer_discrete`
 
 Discrete actions (Dreamer): set `action_space` to `"discrete"` (default `"continuous"`) and `act_unimix` (default 0.01) in the model cfg. `vec.act_dim` is the number of actions; `vec.step` receives a one-hot `(envs, act_dim)` array. The actor is a unimix one-hot categorical trained with REINFORCE on return-normalised advantages; `cfg["eval_greedy"]` (default true) picks argmax or sampling in `evaluate`. `priv_dim` must be at least 1 (use a constant zero column). Continuous-only features (`actor_grad` dynamics/mix, `set_anchor`, `set_data_anchor`, `set_sigma`, `remap_std`) raise ValueError.
 
