@@ -1,11 +1,13 @@
 import hashlib
 import json
+import numpy as np
 import platform
 import re
 import shutil
 import socket
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pyarrow as pa
@@ -16,6 +18,8 @@ REGISTRY_SCHEMA = pa.schema([("name", pa.string()), ("version", pa.int64()), ("p
                              ("schema_fp", pa.string()), ("source", pa.string()), ("created_at", pa.float64())])
 PARQUET_OPTS = {"compression": "zstd"}
 PART = re.compile(r"^(?P<name>.+)_(?P<idx>\d{4})\.parquet$")
+ROLLING = re.compile(r"^(?P<name>.+)_(?P<idx>\d{4})\.rolling$")
+CKPT = re.compile(r"^ckpt_(?P<idx>\d+)\.pt$")
 
 
 def rows_to_table(rows):
@@ -92,27 +96,65 @@ def read_ipc(path):
     return None
 
 
+def indexed(directory, stream, pattern, suffix):
+    out = {}
+    for f in Path(directory).glob(f"{stream}_*{suffix}"):
+        m = pattern.match(f.name)
+        if m and m["name"] == stream:
+            out[int(m["idx"])] = f
+    return out
+
+
+def read_part(f, columns, reader):
+    t = reader(f)
+    if t is None or t.num_rows == 0:
+        return None
+    return t if columns is None else t.select([c for c in columns if c in t.column_names])
+
+
+def snapshot(directory, stream):
+    return indexed(directory, stream, ROLLING, ".rolling"), indexed(directory, stream, PART, ".parquet")
+
+
 def read_parts(directory, stream, columns=None):
     directory = Path(directory)
-    parts = []
-    for f in sorted(directory.glob(f"{stream}_*.parquet")):
-        m = PART.match(f.name)
-        if m and m["name"] == stream:
-            cols = None if columns is None else [c for c in columns if c in pq.read_schema(f).names]
-            parts.append(pq.read_table(f, columns=cols))
     live = directory / f"{stream}.live.arrow"
-    if live.exists():
-        t = read_ipc(live)
-        if t is not None and t.num_rows:
-            parts.append(t if columns is None else t.select([c for c in columns if c in t.column_names]))
-    return parts
+    parts = []
+    for attempt in range(20):
+        rolling, parquet = snapshot(directory, stream)
+        items = sorted([(i, f, pq.read_table) for i, f in parquet.items()] + [(i, f, read_ipc) for i, f in rolling.items() if i not in parquet], key=lambda x: x[0])
+        try:
+            parts = [read_part(f, columns, r) for _, f, r in items]
+            parts.append(read_part(live, columns, read_ipc) if live.exists() else None)
+        except FileNotFoundError:
+            continue
+        after = snapshot(directory, stream)
+        if (set(after[0]), set(after[1])) == (set(rolling), set(parquet)) or attempt == 19:
+            break
+    return [p for p in parts if p is not None]
+
+
+def jsonable(o):
+    if isinstance(o, dict):
+        return {k if isinstance(k, str) else str(k): jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple, set, frozenset)):
+        return [jsonable(v) for v in (sorted(o, key=str) if isinstance(o, (set, frozenset)) else o)]
+    if isinstance(o, np.ndarray):
+        return jsonable(o.tolist())
+    if isinstance(o, np.generic):
+        return jsonable(o.item())
+    if o is None or isinstance(o, (str, bool, int, float)):
+        return o
+    if isinstance(o, bytes):
+        return o.decode("utf-8", "replace")
+    return str(o)
 
 
 def atomic_write_json(path, obj):
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2, default=str)
+        json.dump(jsonable(obj), f, indent=2)
     tmp.replace(path)
 
 
@@ -140,9 +182,12 @@ class Stream:
         self.arrow_path = self.base_dir / f"{name}.live.arrow"
         self.pending = []
         self.last_roll = time.time()
-        self.roll_idx = 1 + max([int(m["idx"]) for f in self.base_dir.glob(f"{name}_*.parquet") if (m := PART.match(f.name)) and m["name"] == name], default=-1)
+        self.executor = None
+        self.futures = []
         self.sink = None
         self.writer = None
+        self.roll_idx = 1 + max([*indexed(self.base_dir, name, PART, ".parquet"), *indexed(self.base_dir, name, ROLLING, ".rolling")], default=-1)
+        self.salvage()
         self.roll_live()
 
     def add(self, item):
@@ -191,21 +236,46 @@ class Stream:
         if errors:
             raise errors[0]
 
+    def convert(self, rolling, final):
+        t = read_ipc(rolling)
+        if t is None:
+            rolling.replace(rolling.with_name(f"{rolling.name}.{time.time_ns()}.corrupt"))
+            return
+        if t.num_rows:
+            tmp = final.with_suffix(".parquet.tmp")
+            pq.write_table(t, str(tmp), **self.parquet_opts)
+            tmp.replace(final)
+        rolling.unlink(missing_ok=True)
+
+    def part_path(self, idx, suffix):
+        return self.base_dir / f"{self.name}_{idx:04d}{suffix}"
+
+    def salvage(self):
+        for idx, f in sorted(indexed(self.base_dir, self.name, ROLLING, ".rolling").items()):
+            if self.part_path(idx, ".parquet").exists():
+                f.unlink(missing_ok=True)
+            else:
+                self.convert(f, self.part_path(idx, ".parquet"))
+
     def roll_live(self):
         self.close_writer()
         if not self.arrow_path.exists():
             return
-        t = read_ipc(self.arrow_path)
-        if t is None:
-            self.arrow_path.replace(self.arrow_path.with_name(f"{self.name}.{time.time_ns()}.corrupt"))
-            return
-        if t.num_rows:
-            final = self.base_dir / f"{self.name}_{self.roll_idx:04d}.parquet"
-            tmp = final.with_suffix(".parquet.tmp")
-            pq.write_table(t, str(tmp), **self.parquet_opts)
-            tmp.replace(final)
-            self.roll_idx += 1
-        self.arrow_path.unlink(missing_ok=True)
+        idx = self.roll_idx
+        rolling = self.part_path(idx, ".rolling")
+        self.arrow_path.replace(rolling)
+        self.roll_idx += 1
+        if self.executor is None:
+            self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"roll-{self.name}")
+        self.futures.append(self.executor.submit(self.convert, rolling, self.part_path(idx, ".parquet")))
+
+    def join(self):
+        if self.executor is not None:
+            self.executor.shutdown(wait=True)
+            self.executor = None
+        futures, self.futures = self.futures, []
+        for f in futures:
+            f.result()
 
     def roll(self):
         try:
@@ -220,7 +290,10 @@ class Stream:
             self.roll()
 
     def close(self):
-        self.roll()
+        try:
+            self.roll()
+        finally:
+            self.join()
 
 
 class Run:
@@ -273,8 +346,22 @@ class Run:
     def close(self):
         self.each("close")
 
+    def update_meta(self, **blobs):
+        self.meta.update(blobs)
+        atomic_write_json(self.run_dir / "run_meta.json", self.meta)
+
     def ckpt_path(self, name):
-        return self.ckpt_dir / name
+        if isinstance(name, str):
+            return self.ckpt_dir / (name if "." in name else f"{name}.pt")
+        return self.ckpt_dir / f"ckpt_{int(name)}.pt"
+
+    def checkpoints(self):
+        found = [(int(m["idx"]), f) for f in self.ckpt_dir.iterdir() if (m := CKPT.match(f.name))]
+        return [f for _, f in sorted(found)]
+
+    def latest(self):
+        found = self.checkpoints()
+        return found[-1] if found else None
 
     def __enter__(self):
         return self
@@ -331,7 +418,7 @@ class Lake:
         for f in (self.root / "runs").glob("*/*"):
             if f.name.endswith(".live.arrow"):
                 names.add(f.name[:-len(".live.arrow")])
-            elif f.suffix == ".parquet" and (m := PART.match(f.name)):
+            elif f.suffix in (".parquet", ".rolling") and (m := (PART if f.suffix == ".parquet" else ROLLING).match(f.name)):
                 names.add(m["name"])
         return sorted(names)
 
