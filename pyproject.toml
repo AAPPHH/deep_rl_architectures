@@ -13,6 +13,7 @@ dependencies = ["torch", "numpy"]
 
 [project.optional-dependencies]
 ray = ["ray"]
+lake = ["pyarrow", "duckdb", "pandas"]
 
 [tool.setuptools]
 packages = ["deep_rl_architectures", "deep_rl_architectures.tests"]
