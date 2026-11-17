@@ -359,10 +359,6 @@ class LakeCase(unittest.TestCase):
         self.assertEqual(run.latest().name, "ckpt_10.pt")
         run.close()
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_review_nested_streams(self):
         d = self.lake.run_dir("n1") / "traj" / "gate_events"
         d.mkdir(parents=True)
@@ -441,3 +437,7 @@ if __name__ == "__main__":
                 run.log("x", {"a": 1})
                 run.streams["x"].convert = lambda *a: (_ for _ in ()).throw(OSError("boom"))
                 raise ValueError("train")
+
+
+if __name__ == "__main__":
+    unittest.main()
