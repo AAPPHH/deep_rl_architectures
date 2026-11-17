@@ -448,8 +448,6 @@ class Lake:
     def __init__(self, root="lake", prefix="run"):
         self.root = Path(root)
         self.prefix = prefix
-        for sub in ("runs", "datasets", "recon"):
-            (self.root / sub).mkdir(parents=True, exist_ok=True)
         self.registry_path = self.root / "registry.parquet"
 
     def run(self, run_id=None, config=None, streams=None, roll_interval_s=600, resume_source=None):

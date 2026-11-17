@@ -438,6 +438,13 @@ class LakeCase(unittest.TestCase):
                 run.streams["x"].convert = lambda *a: (_ for _ in ()).throw(OSError("boom"))
                 raise ValueError("train")
 
+    def test_reading_creates_nothing(self):
+        root = Path(self.tmp.name) / "ro"
+        (root / "runs" / "r1").mkdir(parents=True)
+        lake = Lake(root)
+        lake.runs(), lake.stream_names(), lake.read("r1", "metrics"), lake.registry()
+        self.assertEqual(sorted(p.relative_to(root).as_posix() for p in root.rglob("*")), ["runs", "runs/r1"])
+
 
 if __name__ == "__main__":
     unittest.main()
